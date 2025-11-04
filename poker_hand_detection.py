@@ -8,8 +8,9 @@ import sys
 import time
 import subprocess
 import tempfile
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 import logging
 
 # Add YOLO11 detection module to path
@@ -30,6 +31,7 @@ DETECTION_DELAY = 5
 SCRCPY_PATH = Path(r"C:\Poker_3.11.25\scrcpy")
 YOLO_WEIGHTS_PATH = Path(r"C:\Poker_3.11.25\yolo11-poker-hand-detection-and-analysis-main\weights\poker_best.pt")
 OUTPUT_DIR = Path(r"C:\Poker_3.11.25\output")
+DEVICE_MAPPING_FILE = Path(r"C:\Poker_3.11.25\device_mapping.json")
 
 # ADB executable path (within scrcpy directory)
 ADB_EXE = SCRCPY_PATH / "adb.exe"
@@ -93,6 +95,93 @@ class CardFormatter:
         
         suit_symbol = CardFormatter.SUIT_SYMBOLS.get(suit, suit)
         return f"{rank}{suit_symbol}"
+
+
+class DeviceManager:
+    """Manages device serial number to player name mapping."""
+    
+    def __init__(self, mapping_file: Path):
+        """
+        Initialize device manager.
+        
+        Args:
+            mapping_file: Path to JSON file storing device mappings
+        """
+        self.mapping_file = mapping_file
+        self.device_to_player: Dict[str, str] = {}
+        self.load_mappings()
+    
+    def load_mappings(self):
+        """Load device mappings from JSON file."""
+        try:
+            if self.mapping_file.exists():
+                with open(self.mapping_file, 'r', encoding='utf-8') as f:
+                    self.device_to_player = json.load(f)
+                logger.info(f"Loaded {len(self.device_to_player)} device mapping(s) from {self.mapping_file}")
+            else:
+                logger.info("No existing device mappings found. New mappings will be created.")
+        except Exception as e:
+            logger.warning(f"Error loading device mappings: {e}. Starting with empty mappings.")
+            self.device_to_player = {}
+    
+    def save_mappings(self):
+        """Save device mappings to JSON file."""
+        try:
+            with open(self.mapping_file, 'w', encoding='utf-8') as f:
+                json.dump(self.device_to_player, f, indent=2, ensure_ascii=False)
+            logger.info(f"Saved device mappings to {self.mapping_file}")
+        except Exception as e:
+            logger.error(f"Error saving device mappings: {e}")
+    
+    def get_player_name(self, device_serial: str) -> Optional[str]:
+        """
+        Get player name for a device serial number.
+        
+        Args:
+            device_serial: Device serial number
+        
+        Returns:
+            Player name if mapped, None otherwise
+        """
+        return self.device_to_player.get(device_serial)
+    
+    def register_device(self, device_serial: str, player_name: str):
+        """
+        Register a new device with a player name.
+        
+        Args:
+            device_serial: Device serial number
+            player_name: Player name
+        """
+        self.device_to_player[device_serial] = player_name
+        self.save_mappings()
+        logger.info(f"Registered device {device_serial} as player: {player_name}")
+    
+    def prompt_for_player_name(self, device_serial: str) -> str:
+        """
+        Prompt user for player name for a new device.
+        
+        Args:
+            device_serial: Device serial number
+        
+        Returns:
+            Player name entered by user
+        """
+        print(f"\nNew device detected: {device_serial}")
+        while True:
+            player_name = input("Enter a name for this player: ").strip()
+            if player_name:
+                # Sanitize filename - remove invalid characters
+                invalid_chars = '<>:"/\\|?*'
+                sanitized_name = ''.join(c for c in player_name if c not in invalid_chars)
+                if sanitized_name != player_name:
+                    logger.warning(f"Removed invalid characters from player name: {player_name} -> {sanitized_name}")
+                    player_name = sanitized_name
+                
+                if player_name:
+                    self.register_device(device_serial, player_name)
+                    return player_name
+            print("Please enter a valid player name.")
 
 
 class ADBManager:
@@ -214,6 +303,7 @@ class PokerHandDetector:
         adb_path: Path,
         weights_path: Path,
         output_dir: Path,
+        device_mapping_file: Path,
         confidence: float = 0.5
     ):
         """
@@ -225,11 +315,13 @@ class PokerHandDetector:
             adb_path: Path to adb.exe
             weights_path: Path to YOLO weights file
             output_dir: Directory to save output files
+            device_mapping_file: Path to device mapping JSON file
             confidence: YOLO confidence threshold
         """
         self.num_players = num_players
         self.detection_delay = detection_delay
         self.adb_manager = ADBManager(adb_path)
+        self.device_manager = DeviceManager(device_mapping_file)
         self.weights_path = weights_path
         self.output_dir = output_dir
         self.confidence = confidence
@@ -314,61 +406,61 @@ class PokerHandDetector:
         formatted_cards = [CardFormatter.format_card(card) for card in cards]
         return ", ".join(formatted_cards)
     
-    def save_player_result(self, player_num: int, card_string: str):
+    def save_player_result(self, player_name: str, card_string: str):
         """
         Save detected cards to player's output file.
         
         Args:
-            player_num: Player number (1-based)
+            player_name: Player name
             card_string: Formatted card string
         """
-        output_file = self.output_dir / f"player{player_num}.txt"
+        output_file = self.output_dir / f"{player_name}.txt"
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(card_string)
-            logger.info(f"Saved result for player {player_num}: {card_string}")
+            logger.info(f"Saved result for {player_name}: {card_string}")
         except Exception as e:
-            logger.error(f"Error saving result for player {player_num}: {e}")
+            logger.error(f"Error saving result for {player_name}: {e}")
     
-    def process_player(self, device_id: str, player_num: int) -> bool:
+    def process_player(self, device_id: str, player_name: str) -> bool:
         """
         Process a single player's device.
         
         Args:
             device_id: Device serial number
-            player_num: Player number (1-based)
+            player_name: Player name
         
         Returns:
             True if successful, False otherwise
         """
-        image_path = self.temp_dir / f"player{player_num}_capture.png"
+        image_path = self.temp_dir / f"{player_name}_capture.png"
         
         # Capture from camera (captures screen with camera preview if camera app is open)
         if not self.adb_manager.capture_from_camera(device_id, image_path):
-            logger.warning(f"Failed to capture image for player {player_num} (device {device_id})")
+            logger.warning(f"Failed to capture image for {player_name} (device {device_id})")
             return False
         
         # Detect cards
         cards = self.detect_cards_in_image(image_path)
         if cards is None:
-            logger.warning(f"Card detection failed for player {player_num}")
+            logger.warning(f"Card detection failed for {player_name}")
             return False
         
         # Log detection results
         if len(cards) == 0:
-            logger.info(f"Player {player_num}: No cards detected")
+            logger.info(f"{player_name}: No cards detected")
         else:
-            logger.info(f"Player {player_num}: Detected {len(cards)} card(s): {cards}")
+            logger.info(f"{player_name}: Detected {len(cards)} card(s): {cards}")
         
         # Validate and format
         formatted_result = self.validate_and_format_cards(cards)
         if formatted_result is None:
-            logger.info(f"Player {player_num}: Invalid detection - {len(cards)} cards detected (expected exactly 2)")
+            logger.info(f"{player_name}: Invalid detection - {len(cards)} cards detected (expected exactly 2)")
             return False
         
         # Save result
-        self.save_player_result(player_num, formatted_result)
-        logger.info(f"Player {player_num}: Successfully detected and saved: {formatted_result}")
+        self.save_player_result(player_name, formatted_result)
+        logger.info(f"{player_name}: Successfully detected and saved: {formatted_result}")
         
         return True
     
@@ -386,7 +478,7 @@ class PokerHandDetector:
         logger.info("  1. Open the camera app on each device")
         logger.info("  2. Point camera at the poker cards")
         logger.info("  3. Ensure cards are clearly visible in camera preview")
-        logger.info("  4. Results will be saved to: output/playerX.txt")
+        logger.info("  4. Results will be saved to: output/[PlayerName].txt")
         logger.info("")
         logger.info("Press Ctrl+C to stop")
         logger.info("=" * 60)
@@ -405,12 +497,20 @@ class PokerHandDetector:
                 active_devices = devices[:self.num_players]
                 logger.info(f"Found {len(active_devices)} device(s) (monitoring up to {self.num_players})")
                 
-                # Process each player
-                for idx, device_id in enumerate(active_devices, start=1):
+                # Process each device
+                for device_id in active_devices:
                     try:
-                        self.process_player(device_id, idx)
+                        # Get or prompt for player name
+                        player_name = self.device_manager.get_player_name(device_id)
+                        
+                        if player_name is None:
+                            # New device - prompt for name
+                            player_name = self.device_manager.prompt_for_player_name(device_id)
+                        
+                        # Process the device with the player name
+                        self.process_player(device_id, player_name)
                     except Exception as e:
-                        logger.error(f"Error processing player {idx} (device {device_id}): {e}")
+                        logger.error(f"Error processing device {device_id}: {e}")
                         continue
                 
                 # Wait before next detection cycle
@@ -442,6 +542,7 @@ def main():
             adb_path=ADB_EXE,
             weights_path=YOLO_WEIGHTS_PATH,
             output_dir=OUTPUT_DIR,
+            device_mapping_file=DEVICE_MAPPING_FILE,
             confidence=CONFIDENCE_THRESHOLD
         )
         
